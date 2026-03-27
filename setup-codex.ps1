@@ -54,7 +54,7 @@ Write-Host "  OK: Semua auth OpenAI dibersihkan" -ForegroundColor Green
 Write-Host "[3/5] API Key..." -ForegroundColor Yellow
 
 # Pakai default admin key (customer bisa ganti nanti)
-$apiKey = "gw-admin-SuG66BxPfKh3JzQUC9Rb-9zn9SvrQFYo5YBFhU6WC"
+$apiKey = "gw-admin-b971f472b5644f99b801eb318da6c138"
 
 # Set env var permanen + session
 $env:JEMBATANAI_API_KEY = $apiKey
