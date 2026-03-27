@@ -1,0 +1,16 @@
+[Unit]
+Description=JembatanAI Codex — OpenAI/Codex Compatible Proxy (Port 4110)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/jembatanai-codex
+Environment=PATH=/usr/bin:/home/ubuntu/.local/bin
+EnvironmentFile=/home/ubuntu/jembatanai-codex/.env.codex
+ExecStart=/usr/bin/python3 -m uvicorn proxy_codex:app --host 0.0.0.0 --port 4110 --loop asyncio
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

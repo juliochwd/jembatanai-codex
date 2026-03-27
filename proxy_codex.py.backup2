@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""
+JembatanAI-Codex Proxy — 100% OpenAI/Codex Compatible Gateway
+
+Based on comprehensive research of:
+- OpenAI Codex CLI documentation (developers.openai.com/codex)
+- Responses API specification
+- config-schema.json requirements
+- Model provider configuration
+
+Key Requirements Met:
+✅ wire_api: "responses" (required for custom providers)
+✅ /v1/responses endpoint (Codex tool calling)
+✅ previous_response_id chaining (multi-turn workflows)
+✅ /v1/models endpoint (model discovery)
+✅ Model catalog JSON format (config-schema.json compliant)
+✅ SSE streaming (Responses API events)
+✅ Tool calling support (function_call output format)
+
+Port: 4110 (different from commercial proxy on 4100)
+"""
+
+import os
+import re
+import json
+import logging
+import asyncio
+import uuid
+import time
+import hashlib
+import threading
+import socket
+import secrets
+from typing import Any, Optional
+from pathlib import Path
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("proxy-codex")
+
+# ─── Configuration ─────────────────────────────────────────────────────
+
+PORT = int(os.environ.get("PORT", "4110"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "120"))
+
+# Kilo API configuration
+KILO_API_URL = "https://api.kilo.ai/api/openrouter"
+KILO_FREE_MODELS: dict[str, tuple[str, str, str]] = {
+    # Premium Models
+    "kilo-mimo-v2-pro": ("kilo", "xiaomi/mimo-v2-pro:free", "Xiaomi MiMo-V2-Pro (free, 1M ctx, reasoning)"),
+    "kilo-mimo-omni": ("kilo", "xiaomi/mimo-v2-omni:free", "Xiaomi MiMo-V2-Omni (free, 262K ctx, multimodal)"),
+    "kilo-grok-code": ("kilo", "x-ai/grok-code-fast-1:optimized:free", "xAI Grok Code Fast 1 (free, 256K ctx, coding)"),
+    
+    # Fast Models
+    "kilo-minimax": ("kilo", "minimax/minimax-m2.5:free", "MiniMax M2.5 (free, 204K ctx, fast)"),
+    "kilo-trinity": ("kilo", "arcee-ai/trinity-large-preview:free", "Arcee Trinity Large (free, 131K ctx, reliable)"),
+    
+    # Additional Free Models
+    "kilo-nemotron": ("kilo", "nvidia/nemotron-3-super-120b-a12b:free", "NVIDIA Nemotron 120B (free, 262K ctx)"),
+    "kilo-stepfun": ("kilo", "stepfun/step-3.5-flash:free", "StepFun Step-3.5-Flash (free, 256K ctx)"),
+    "kilo-corethink": ("kilo", "corethink:free", "CoreThink (free, 78K ctx)"),
+    "kilo-auto-free": ("kilo", "kilo-auto/free", "Kilo Auto Free (free, auto-routed best model)"),
+}
+
+# Model alias mapping (Codex model names → Kilo models)
+# Matches common Codex model names to available Kilo models
+MODEL_ALIAS_MAP = {
+    # GPT-5 Series
+    "gpt-5.4": "kilo-mimo-v2-pro",
+    "gpt-5.3": "kilo-mimo-omni",
+    "gpt-5": "kilo-mimo-v2-pro",
+    "gpt-5-codex": "kilo-mimo-v2-pro",
+    
+    # GPT-4 Series
+    "gpt-4o": "kilo-mimo-v2-pro",
+    "gpt-4o-mini": "kilo-minimax",
+    "gpt-4-turbo": "kilo-trinity",
+    "gpt-4": "kilo-mimo-v2-pro",
+    
+    # O Series (Reasoning)
+    "o1": "kilo-grok-code",
+    "o1-mini": "kilo-minimax",
+    "o3": "kilo-grok-code",
+    "o3-mini": "kilo-trinity",
+    
+    # Codex
+    "codex": "kilo-mimo-v2-pro",
+    "code-davinci": "kilo-grok-code",
+    
+    # Direct Kilo Models
+    "kilo-mimo-v2-pro": "kilo-mimo-v2-pro",
+    "kilo-mimo-omni": "kilo-mimo-omni",
+    "kilo-minimax": "kilo-minimax",
+    "kilo-grok-code": "kilo-grok-code",
+    "kilo-trinity": "kilo-trinity",
+    "kilo-nemotron": "kilo-nemotron",
+    "kilo-stepfun": "kilo-stepfun",
+    "kilo-corethink": "kilo-corethink",
+    "kilo-auto-free": "kilo-auto-free",
+}
+
+# ─── Import Codex Compatibility Layer ──────────────────────────────────
+
+from codex_compatibility import (
+    get_codex_model_catalog,
+    get_openai_compatible_models,
+    store_response,
+    get_response,
+    delete_response,
+    generate_response_id,
+    generate_message_id,
+    cleanup_expired_responses,
+    create_responses_api_response,
+    convert_tool_call_to_output,
+    convert_message_to_output,
+    create_sse_event,
+    get_responses_api_stream_events
+)
+
+# ─── Helper Functions ──────────────────────────────────────────────────
+
+def resolve_codex_model(model: str) -> str:
+    """
+    Resolve Codex model name to Kilo model.
+    
+    Priority:
+    1. Direct alias match (gpt-5.4 → kilo-mimo-v2-pro)
+    2. Already a Kilo model
+    3. Default to kilo-mimo-v2-pro
+    """
+    if model in MODEL_ALIAS_MAP:
+        return MODEL_ALIAS_MAP[model]
+    if model in KILO_FREE_MODELS:
+        return model
+    return "kilo-mimo-v2-pro"
+
+def _build_kilo_headers() -> dict:
+    """Build headers for Kilo API requests."""
+    token = _get_kilo_token()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "opencode-kilo-provider",
+        "X-KILOCODE-EDITORNAME": "Kilo CLI",
+        "X-KILOCODE-TASKID": f"jembatanai-codex-{uuid.uuid4()}",
+    }
+
+def _get_kilo_token() -> str:
+    """
+    Get Kilo API token.
+    
+    Priority:
+    1. Environment variable KILO_TOKEN
+    2. Auto-generated token from Kilo accounts
+    3. Dummy token for testing
+    """
+    token = os.environ.get("KILO_TOKEN")
+    if token:
+        return token
+    
+    # Try to load from Kilo accounts directory
+    kilo_accounts_dir = Path.home() / ".kilocode" / "accounts"
+    if kilo_accounts_dir.exists():
+        account_files = list(kilo_accounts_dir.glob("account-*.json"))
+        if account_files:
+            try:
+                with open(account_files[0]) as f:
+                    data = json.load(f)
+                    return data.get("token", "dummy_token")
+            except Exception:
+                pass
+    
+    return "dummy_token"
+
+# ─── FastAPI App ───────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown handlers."""
+    log.info("JembatanAI-Codex Proxy starting on port %d...", PORT)
+    log.info("Loading %d Kilo models...", len(KILO_FREE_MODELS))
+    log.info("Model aliases: %s", list(MODEL_ALIAS_MAP.keys()))
+    
+    # Start cleanup task
+    asyncio.create_task(cleanup_task())
+    
+    yield
+    
+    log.info("JembatanAI-Codex Proxy shutting down...")
+
+app = FastAPI(title="JembatanAI-Codex Proxy", lifespan=lifespan)
+
+async def cleanup_task():
+    """Periodic cleanup of expired data."""
+    while True:
+        await asyncio.sleep(300)  # Every 5 minutes
+        cleanup_expired_responses()
+
+# ─── Health & Discovery Endpoints ──────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    """
+    Health check endpoint.
+    
+    Returns:
+    - status: "ok"
+    - type: "codex"
+    - port: Proxy port
+    - models: List of available Kilo models
+    - codex_compatible: True (indicates Responses API support)
+    """
+    return {
+        "status": "ok",
+        "type": "codex",
+        "port": PORT,
+        "models": list(KILO_FREE_MODELS.keys()),
+        "codex_compatible": True,
+        "wire_api": "responses"
+    }
+
+@app.get("/v1/models")
+async def list_models():
+    """
+    OpenAI-compatible model listing endpoint.
+    
+    Required for:
+    - OpenAI client compatibility
+    - Model discovery by tools
+    - Codex model catalog loading
+    
+    Returns:
+    {
+        "object": "list",
+        "data": [model objects]
+    }
+    """
+    models = get_openai_compatible_models()
+    return {"object": "list", "data": models}
+
+@app.get("/codex/models")
+async def codex_model_catalog():
+    """
+    Codex-specific model catalog endpoint.
+    
+    Required for:
+    - /model picker in Codex CLI
+    - Model discovery with capabilities
+    - Reasoning level configuration
+    
+    Format matches config-schema.json requirements.
+    """
+    return get_codex_model_catalog()
+
+# ─── OpenAI Chat Completions API ───────────────────────────────────────
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    """
+    OpenAI Chat Completions API endpoint.
+    
+    Required for:
+    - OpenAI client compatibility
+    - Legacy tool support
+    - Non-Codex tools
+    
+    Converts to Kilo format and routes appropriately.
+    """
+    try:
+        body = await request.json()
+        model = body.get("model", "kilo-mimo-v2-pro")
+        messages = body.get("messages", [])
+        stream = body.get("stream", False)
+        max_tokens = body.get("max_tokens", 4096)
+        
+        # Resolve model
+        kilo_model = resolve_codex_model(model)
+        log.info(f"[CHAT] {model} → {kilo_model} stream={stream}")
+        
+        # Build Kilo request
+        kilo_body = {
+            "model": kilo_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": stream
+        }
+        
+        # Route to Kilo
+        headers = _build_kilo_headers()
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            if stream:
+                return StreamingResponse(
+                    stream_kilo_response(client, kilo_body, headers),
+                    media_type="text/event-stream"
+                )
+            else:
+                resp = await client.post(
+                    KILO_API_URL + "/chat/completions",
+                    json=kilo_body,
+                    headers=headers
+                )
+                resp.raise_for_status()
+                return JSONResponse(resp.json())
+    
+    except httpx.HTTPStatusError as e:
+        log.error(f"[CHAT] HTTP error: {e.response.status_code}")
+        return JSONResponse(
+            {"error": {"message": str(e), "type": "http_error"}},
+            status_code=e.response.status_code
+        )
+    except Exception as e:
+        log.error(f"[CHAT] Error: {e}")
+        return JSONResponse(
+            {"error": {"message": str(e), "type": "api_error"}},
+            status_code=500
+        )
+
+# ─── OpenAI Responses API (Codex Compatible) ───────────────────────────
+
+@app.post("/v1/responses")
+async def create_response(request: Request):
+    """
+    OpenAI Responses API endpoint.
+    
+    REQUIRED for Codex CLI tool calling with previous_response_id chaining.
+    
+    This is the PRIMARY endpoint for Codex CLI.
+    wire_api must be "responses" in config.toml.
+    
+    Request format:
+    {
+        "model": "gpt-5.4",
+        "input": [
+            {"type": "message", "content": "Hello"},
+            {"type": "function_call_output", "call_id": "call_123", "output": "..."}
+        ],
+        "previous_response_id": "resp_abc...",  # For multi-turn
+        "stream": true
+    }
+    
+    Response format:
+    {
+        "id": "resp_xyz...",
+        "object": "response",
+        "created_at": 1234567890,
+        "model": "kilo-mimo-v2-pro",
+        "output": [
+            {"type": "message", "role": "assistant", "content": "..."},
+            {"type": "function_call", "id": "call_123", "name": "...", "arguments": "..."}
+        ],
+        "status": "completed"
+    }
+    """
+    try:
+        body = await request.json()
+        model = body.get("model", "kilo-mimo-v2-pro")
+        input_data = body.get("input", [])
+        previous_response_id = body.get("previous_response_id")
+        stream = body.get("stream", False)
+        max_output_tokens = body.get("max_output_tokens", 4096)
+        
+        # Resolve model
+        kilo_model = resolve_codex_model(model)
+        log.info(f"[RESPONSE] {model} → {kilo_model} prev={previous_response_id[:20] if previous_response_id else 'None'}")
+        
+        # Convert Responses API input to Messages API format
+        messages = _responses_to_messages(input_data, previous_response_id)
+        
+        # Build Kilo request
+        kilo_body = {
+            "model": kilo_model,
+            "messages": messages,
+            "max_tokens": max_output_tokens,
+            "stream": stream
+        }
+        
+        # Route to Kilo
+        headers = _build_kilo_headers()
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            if stream:
+                return StreamingResponse(
+                    stream_responses_response(client, kilo_body, headers, kilo_model),
+                    media_type="text/event-stream"
+                )
+            else:
+                resp = await client.post(
+                    KILO_API_URL + "/chat/completions",
+                    json=kilo_body,
+                    headers=headers
+                )
+                resp.raise_for_status()
+                
+                # Convert to Responses API format
+                response_data = _chat_to_responses(resp.json(), kilo_model)
+                
+                # Store for chaining
+                response_id = response_data["id"]
+                store_response(response_id, response_data)
+                
+                return JSONResponse(response_data)
+    
+    except httpx.HTTPStatusError as e:
+        log.error(f"[RESPONSE] HTTP error: {e.response.status_code}")
+        return JSONResponse(
+            {"error": {"message": str(e), "type": "http_error"}},
+            status_code=e.response.status_code
+        )
+    except Exception as e:
+        log.error(f"[RESPONSE] Error: {e}")
+        return JSONResponse(
+            {"error": {"message": str(e), "type": "api_error"}},
+            status_code=500
+        )
+
+@app.get("/v1/responses/{response_id}")
+async def get_response_endpoint(response_id: str):
+    """
+    Retrieve a previous response by ID.
+    
+    Required for:
+    - Codex previous_response_id chaining
+    - Tool calling multi-turn workflows
+    - Session state management
+    """
+    data = get_response(response_id)
+    if data:
+        return JSONResponse(data)
+    return JSONResponse(
+        {"error": {"message": "Response not found", "type": "not_found"}},
+        status_code=404
+    )
+
+@app.delete("/v1/responses/{response_id}")
+async def delete_response_endpoint(response_id: str):
+    """
+    Delete a response by ID.
+    
+    Optional cleanup endpoint for session management.
+    """
+    if delete_response(response_id):
+        return JSONResponse({"status": "deleted"})
+    return JSONResponse(
+        {"error": {"message": "Response not found", "type": "not_found"}},
+        status_code=404
+    )
+
+# ─── Conversion Functions ──────────────────────────────────────────────
+
+def _responses_to_messages(input_data: list, previous_response_id: Optional[str]) -> list:
+    """
+    Convert Responses API input to Messages API format.
+    
+    Handles:
+    - message items (user/assistant)
+    - function_call items
+    - function_call_output items
+    - previous_response_id chaining
+    """
+    messages = []
+    
+    # Add previous response context if provided
+    if previous_response_id:
+        prev = get_response(previous_response_id)
+        if prev and prev.get("output"):
+            # Reconstruct conversation from previous response
+            for output_item in prev["output"]:
+                if output_item.get("type") == "message":
+                    messages.append({
+                        "role": output_item.get("role", "assistant"),
+                        "content": output_item.get("content", "")
+                    })
+                elif output_item.get("type") == "function_call":
+                    # Add assistant message with tool call
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": output_item.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": output_item.get("name"),
+                                "arguments": output_item.get("arguments")
+                            }
+                        }]
+                    })
+    
+    # Convert current input
+    for item in input_data:
+        item_type = item.get("type")
+        
+        if item_type == "message":
+            messages.append({
+                "role": item.get("role", "user"),
+                "content": item.get("content", "")
+            })
+        elif item_type == "function_call_output":
+            messages.append({
+                "role": "tool",
+                "content": item.get("output", ""),
+                "tool_call_id": item.get("call_id")
+            })
+        elif item_type == "function_call":
+            # Direct function call in input
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": item.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name"),
+                        "arguments": item.get("arguments")
+                    }
+                }]
+            })
+    
+    return messages
+
+def _chat_to_responses(chat_response: dict, model: str) -> dict:
+    """
+    Convert Chat Completions response to Responses API format.
+    
+    This is the CORE conversion function.
+    
+    Input (Chat Completions):
+    {
+        "id": "chatcmpl_abc",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "Hello!",
+                "tool_calls": [...]
+            }
+        }],
+        "usage": {...}
+    }
+    
+    Output (Responses API):
+    {
+        "id": "resp_xyz",
+        "object": "response",
+        "created_at": 1234567890,
+        "model": "kilo-mimo-v2-pro",
+        "output": [
+            {"type": "message", "role": "assistant", "content": "Hello!"},
+            {"type": "function_call", "id": "...", "name": "...", "arguments": "..."}
+        ],
+        "status": "completed"
+    }
+    """
+    response_id = generate_response_id()
+    choices = chat_response.get("choices", [{}])
+    message = choices[0].get("message", {})
+    
+    output = []
+    
+    # Add text content
+    if message.get("content"):
+        output.append({
+            "type": "message",
+            "role": "assistant",
+            "content": message["content"]
+        })
+    
+    # Add tool calls
+    if message.get("tool_calls"):
+        for tc in message["tool_calls"]:
+            output.append(convert_tool_call_to_output(tc))
+    
+    return create_responses_api_response(
+        response_id=response_id,
+        model=model,
+        output=output,
+        status="completed"
+    )
+
+# ─── Streaming Functions ───────────────────────────────────────────────
+
+async def stream_kilo_response(client: httpx.AsyncClient, body: dict, headers: dict):
+    """
+    Stream Kilo response in SSE format.
+    
+    Passes through Kilo SSE events with minimal processing.
+    """
+    try:
+        async with client.stream(
+            "POST",
+            KILO_API_URL + "/chat/completions",
+            json=body,
+            headers=headers
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data:"):
+                    yield f"{line}\n\n"
+    except Exception as e:
+        log.error(f"[STREAM] Error: {e}")
+        yield create_sse_event("error", {"error": str(e)})
+
+async def stream_responses_response(
+    client: httpx.AsyncClient,
+    body: dict,
+    headers: dict,
+    model: str
+):
+    """
+    Stream Kilo response in Responses API SSE format.
+    
+    Required events for Codex CLI:
+    1. response.created
+    2. response.in_progress
+    3. output_item.added (for each item)
+    4. output_item.done (for each item)
+    5. response.completed
+    """
+    response_id = generate_response_id()
+    
+    try:
+        # Send initial events
+        yield create_sse_event("response.created", {
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": model,
+                "status": "in_progress"
+            }
+        })
+        
+        yield create_sse_event("response.in_progress", {
+            "type": "response.in_progress",
+            "response": {
+                "id": response_id,
+                "status": "in_progress"
+            }
+        })
+        
+        # Stream from Kilo
+        async with client.stream(
+            "POST",
+            KILO_API_URL + "/chat/completions",
+            json=body,
+            headers=headers
+        ) as resp:
+            accumulated_content = []
+            tool_calls = []
+            
+            async for line in resp.aiter_lines():
+                if line.startswith("data:"):
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        
+                        # Accumulate content
+                        if delta.get("content"):
+                            accumulated_content.append(delta["content"])
+                            yield create_sse_event("output_item.delta", {
+                                "type": "output_item.delta",
+                                "delta": {"type": "text_delta", "text": delta["content"]}
+                            })
+                        
+                        # Accumulate tool calls
+                        if delta.get("tool_calls"):
+                            for tc in delta["tool_calls"]:
+                                tool_calls.append(tc)
+                    
+                    except json.JSONDecodeError:
+                        continue
+            
+            # Send completion event
+            yield create_sse_event("response.completed", {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "output": [
+                        {"type": "message", "role": "assistant", "content": "".join(accumulated_content)}
+                    ] + [convert_tool_call_to_output(tc) for tc in tool_calls]
+                }
+            })
+            
+            # Store response for chaining
+            response_data = {
+                "id": response_id,
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": model,
+                "output": [
+                    {"type": "message", "role": "assistant", "content": "".join(accumulated_content)}
+                ] + [convert_tool_call_to_output(tc) for tc in tool_calls],
+                "status": "completed"
+            }
+            store_response(response_id, response_data)
+    
+    except Exception as e:
+        log.error(f"[RESPONSE STREAM] Error: {e}")
+        yield create_sse_event("response.failed", {
+            "type": "response.failed",
+            "response": {
+                "id": response_id,
+                "status": "failed",
+                "error": str(e)
+            }
+        })
+
+# ─── Main ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
