@@ -56,139 +56,102 @@ import httpx
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("proxy-codex")
 
-# ─── Firebase Auth (API Key Validation) ────────────────────────────────
-# Uses same Firestore database as ai-gateway-website for customer API keys
+# ─── Website API Auth (API Key Validation) ───────────────────────────────
+# DNS issues prevent direct Supabase access from Python httpx.
+# Instead, we call the website's /api/codex/* endpoints which can reach Supabase.
 
 from datetime import datetime, timezone
+import httpx
 
-_firebase_initialized = False
-_firestore_client = None
-
-
-def _init_firebase():
-    """Initialize Firebase Admin SDK for API key validation."""
-    global _firebase_initialized, _firestore_client
-    if _firebase_initialized:
-        return
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
-
-        try:
-            firebase_admin.get_app()
-        except ValueError:
-            cred_path = os.environ.get(
-                "GOOGLE_APPLICATION_CREDENTIALS",
-                str(
-                    Path.home() / "ai-gateway-website" / "firebase-service-account.json"
-                ),
-            )
-            if os.path.exists(cred_path):
-                cred = credentials.Certificate(cred_path)
-                firebase_admin.initialize_app(cred)
-                log.info("Firebase initialized for API key validation")
-            else:
-                log.warning(f"Firebase creds not found at {cred_path}")
-                return
-        _firestore_client = firestore.client()
-        _firebase_initialized = True
-        log.info("Firestore client ready for API key validation")
-    except Exception as e:
-        log.warning(f"Firebase init failed: {e} — API key validation disabled")
+_WEBSITE_API = "http://127.0.0.1:3000"
+_website_client: httpx.AsyncClient | None = None
 
 
-# Plan daily limits (same as website)
+def _get_website_client() -> httpx.AsyncClient:
+    """Get or create the website API client."""
+    global _website_client
+    if _website_client is None:
+        _website_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
+    return _website_client
+
+
+# Plan daily limits (same as website plan-config.js)
 PLAN_DAILY_LIMITS = {
-    "free": 20,
-    "starter": 200,
-    "pro": 1000,
+    "free": 50,
+    "starter": 500,
+    "pro": 1500,
     "team": 5000,
 }
 
 
-def validate_api_key(api_key: str) -> dict | None:
-    """Validate API key against Firestore. Returns {key, user} or None."""
-    if not _firestore_client:
-        return None
+async def validate_api_key(api_key: str) -> dict | None:
+    """Validate API key via website API. Returns {key, user} or None."""
     try:
-        docs = (
-            _firestore_client.collection("api_keys")
-            .where("key_value", "==", api_key)
-            .where("is_active", "==", True)
-            .limit(1)
-            .get()
+        client = _get_website_client()
+        response = await client.post(
+            f"{_WEBSITE_API}/api/codex/validate",
+            headers={"x-api-key": api_key},
+            timeout=10.0,
         )
-        if not docs:
+        log.info(f"[AUTH] validate_api_key status={response.status_code}")
+        if response.status_code == 401:
             return None
-        key_doc = docs[0]
-        key_data = key_doc.to_dict()
-        key_data["id"] = key_doc.id
-
-        user_id = key_data.get("user_id")
-        user_doc = _firestore_client.collection("users").document(user_id).get()
-        if not user_doc.exists:
+        if response.status_code == 403:
+            return {"error": "expired"}
+        if response.status_code != 200:
+            log.warning(f"[AUTH] Unexpected status {response.status_code}: {response.text}")
             return None
-        user_data = user_doc.to_dict()
-        user_data["id"] = user_id
-
-        # Check subscription expiry
-        plan_expires = user_data.get("plan_expires_at")
-        if plan_expires:
-            if isinstance(plan_expires, str):
-                exp = datetime.fromisoformat(plan_expires.replace("Z", "+00:00"))
-            else:
-                exp = plan_expires
-            if exp < datetime.now(timezone.utc):
-                return {"error": "expired"}
-
-        return {"key": key_data, "user": user_data}
+        data = response.json()
+        return {
+            "key": {
+                "id": data["key"]["id"],
+                "name": data["key"].get("name", ""),
+                "models": data["key"].get("models", "all"),
+            },
+            "user": {
+                "id": data["user"]["id"],
+                "email": data["user"].get("email", ""),
+                "plan": data["user"].get("plan", "free"),
+                "plan_expires_at": data["user"].get("plan_expires_at"),
+            },
+        }
     except Exception as e:
         log.warning(f"API key validation error: {e}")
         return None
 
 
-def check_daily_quota(user_id: str, plan: str) -> tuple:
-    """Check daily quota. Returns (allowed: bool, used: int, limit: int)."""
-    if not _firestore_client:
-        return True, 0, 0
+async def check_daily_quota(user_id: str, plan: str) -> tuple:
+    """Check daily quota via website API. Returns (allowed: bool, used: int, limit: int)."""
+    limit = PLAN_DAILY_LIMITS.get(plan, 20)
     try:
-        limit = PLAN_DAILY_LIMITS.get(plan, 20)
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        doc_id = f"{user_id}:{today}"
-        doc = _firestore_client.collection("codex_daily_usage").document(doc_id).get()
-        used = doc.to_dict().get("count", 0) if doc.exists else 0
-        return used < limit, used, limit
+        client = _get_website_client()
+        response = await client.get(
+            f"{_WEBSITE_API}/api/codex/quota/{user_id}",
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            log.warning(f"Quota check failed: {response.status_code}")
+            return False, 0, limit
+        data = response.json()
+        used = data.get("used", 0)
+        return data.get("allowed", False), used, data.get("limit", limit)
     except Exception as e:
         log.warning(f"Quota check error: {e}")
-        return True, 0, 0
+        return False, 0, limit
 
 
-def increment_usage(user_id: str, api_key_id: str, model: str):
-    """Increment daily usage counter and log."""
-    if not _firestore_client:
-        return
+async def increment_usage(user_id: str, api_key_id: str, model: str):
+    """Increment daily usage counter via website API."""
     try:
-        from google.cloud.firestore_v1 import Increment
-
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        doc_id = f"{user_id}:{today}"
-        _firestore_client.collection("codex_daily_usage").document(doc_id).set(
-            {
-                "count": Increment(1),
-                "user_id": user_id,
-                "last_model": model,
-                "last_at": datetime.now(timezone.utc).isoformat(),
-            },
-            merge=True,
-        )
-        _firestore_client.collection("usage_logs").add(
-            {
+        client = _get_website_client()
+        await client.post(
+            f"{_WEBSITE_API}/api/codex/usage",
+            json={
                 "user_id": user_id,
                 "api_key_id": api_key_id,
                 "model": model,
-                "type": "codex",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            },
+            timeout=10.0,
         )
     except Exception as e:
         log.warning(f"Usage increment error: {e}")
@@ -1039,7 +1002,7 @@ def _responses_to_messages(
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": "",
+                            "content": None,
                             "tool_calls": [
                                 {
                                     "id": output_item.get(
@@ -1101,7 +1064,7 @@ def _responses_to_messages(
             messages.append(
                 {
                     "role": "assistant",
-                    "content": "",
+                    "content": None,
                     "tool_calls": [
                         {
                             "id": call_id,
@@ -1179,15 +1142,10 @@ def _chat_to_responses(chat_response: dict, model: str) -> dict:
     usage = chat_response.get("usage", {})
     finish_reason = choices[0].get("finish_reason", "stop")
 
-    # B3 FIX: Set status based on finish_reason
-    if finish_reason == "length":
-        status = "incomplete"
-    elif finish_reason == "tool_calls":
-        status = "completed"
-    elif finish_reason == "stop":
-        status = "completed"
-    else:
-        status = "completed"
+    # Custom models: ALWAYS "completed" — "incomplete" triggers continuation
+    # which only works with native OpenAI models that support it.
+    # All our Kilo/OpenRouter models are custom and don't support continuation.
+    status = "completed"
 
     return {
         "id": response_id,
@@ -1848,9 +1806,6 @@ async def lifespan(app: FastAPI):
     log.info("TOR available: %s", _tor_available())
     log.info("Loading %d Kilo models...", len(KILO_FREE_MODELS))
 
-    # Initialize Firebase for API key validation
-    _init_firebase()
-
     asyncio.create_task(_model_refresh_loop())
     asyncio.create_task(_session_cleanup_loop())
 
@@ -1948,59 +1903,59 @@ async def codex_model_catalog():
 async def chat_completions(request: Request):
     """OpenAI Chat Completions endpoint. Routes to Kilo API directly."""
     try:
-        # ── API Key Auth (skip for localhost) ──
-        client_ip = request.client.host if request.client else "unknown"
-        if client_ip not in ("127.0.0.1", "::1", "localhost"):
-            api_key = (
-                request.headers.get("authorization", "").replace("Bearer ", "").strip()
+        # ── API Key Auth (always required for usage tracking) ──
+        auth_result = None  # Initialize for all paths
+        api_key = (
+            request.headers.get("authorization", "").replace("Bearer ", "").strip()
+        )
+        if not api_key:
+            api_key = request.headers.get("x-api-key", "").strip()
+        if not api_key:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "Missing or invalid API key.",
+                        "type": "authentication_error",
+                    }
+                },
+                status_code=401,
             )
-            if not api_key:
-                api_key = request.headers.get("x-api-key", "").strip()
-            if not api_key:
-                return JSONResponse(
-                    {
-                        "error": {
-                            "message": "Missing or invalid API key.",
-                            "type": "authentication_error",
-                        }
-                    },
-                    status_code=401,
-                )
-            auth_result = validate_api_key(api_key)
-            if auth_result is None:
-                return JSONResponse(
-                    {
-                        "error": {
-                            "message": "Invalid API key.",
-                            "type": "authentication_error",
-                        }
-                    },
-                    status_code=401,
-                )
-            if auth_result.get("error") == "expired":
-                return JSONResponse(
-                    {
-                        "error": {
-                            "message": "Subscription expired.",
-                            "type": "permission_error",
-                        }
-                    },
-                    status_code=403,
-                )
-            user = auth_result["user"]
-            allowed, used, limit = check_daily_quota(
-                user["id"], user.get("plan", "free")
+        auth_result = await validate_api_key(api_key)
+        log.info(f"[CHAT] DEBUG: validate_api_key result={auth_result is not None}, error={auth_result.get('error') if isinstance(auth_result, dict) else None}")
+        if auth_result is None:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "Invalid API key.",
+                        "type": "authentication_error",
+                    }
+                },
+                status_code=401,
             )
-            if not allowed:
-                return JSONResponse(
-                    {
-                        "error": {
-                            "message": f"Daily quota exceeded ({used}/{limit}).",
-                            "type": "rate_limit_error",
-                        }
-                    },
-                    status_code=429,
-                )
+        if auth_result.get("error") == "expired":
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "Subscription expired.",
+                        "type": "permission_error",
+                    }
+                },
+                status_code=403,
+            )
+        user = auth_result["user"]
+        allowed, used, limit = await check_daily_quota(
+            user["id"], user.get("plan", "free")
+        )
+        if not allowed:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": f"Daily quota exceeded ({used}/{limit}).",
+                        "type": "rate_limit_error",
+                    }
+                },
+                status_code=429,
+            )
 
         body = await request.json()
         model = body.get("model", "kilo-mimo-v2-pro")
@@ -2029,14 +1984,29 @@ async def chat_completions(request: Request):
         headers = _build_kilo_headers()
 
         if stream:
+            # Wrap streaming to track usage after completion
+            async def _stream_with_usage():
+                async for chunk in _stream_chat_completions(kilo_body, headers):
+                    yield chunk
+                if auth_result:
+                    try:
+                        await increment_usage(
+                            auth_result["user"]["id"],
+                            auth_result["key"]["id"],
+                            kilo_alias,
+                        )
+                    except Exception:
+                        pass
             return StreamingResponse(
-                _stream_chat_completions(kilo_body, headers),
+                _stream_with_usage(),
                 media_type="text/event-stream",
             )
         else:
+            log.info(f"[CHAT] DEBUG: Before _request_with_retry, auth_result={auth_result is not None}")
             resp = await _request_with_retry(
                 f"{KILO_API_URL}/chat/completions", kilo_body, headers
             )
+            log.info(f"[CHAT] DEBUG: After request, resp={resp is not None}, status={resp.status_code if resp else None}")
             if resp is None or resp.status_code != 200:
                 # Fallback to OpenRouter when Kilo is exhausted or down
                 if _kilo_is_exhausted() or _kilo_is_down():
@@ -2064,6 +2034,18 @@ async def chat_completions(request: Request):
                     )
                     if reasoning.strip():
                         msg["content"] = reasoning
+            # Track usage for authenticated customers
+            if auth_result:
+                try:
+                    log.info(f"[CHAT] Incrementing usage for user {auth_result['user']['id']}")
+                    await increment_usage(
+                        auth_result["user"]["id"],
+                        auth_result["key"]["id"],
+                        kilo_alias,
+                    )
+                except Exception as e:
+                    log.error(f"[CHAT] Increment usage failed: {e}")
+
             return JSONResponse(data)
 
     except Exception as e:
@@ -2116,7 +2098,7 @@ async def create_response(request: Request):
                     },
                     status_code=401,
                 )
-            auth_info = validate_api_key(api_key)
+            auth_info = await validate_api_key(api_key)
             if auth_info is None:
                 return JSONResponse(
                     {
@@ -2140,7 +2122,7 @@ async def create_response(request: Request):
             # Check daily quota
             user = auth_info["user"]
             plan = user.get("plan", "free")
-            allowed, used, limit = check_daily_quota(user["id"], plan)
+            allowed, used, limit = await check_daily_quota(user["id"], plan)
             if not allowed:
                 return JSONResponse(
                     {
@@ -2277,6 +2259,14 @@ async def create_response(request: Request):
                 # Skip other tool types (web_search, local_shell, etc.) — not supported
             if openai_tools:
                 kilo_body["tools"] = openai_tools
+                # Pass through tool_choice if provided
+                tc = body.get("tool_choice")
+                if tc is not None:
+                    kilo_body["tool_choice"] = tc
+                # Pass through parallel_tool_calls if provided
+                ptc = body.get("parallel_tool_calls")
+                if ptc is not None:
+                    kilo_body["parallel_tool_calls"] = ptc
 
         headers = _build_kilo_headers()
 
@@ -2290,7 +2280,7 @@ async def create_response(request: Request):
                 # Track usage after stream completes
                 if auth_info:
                     try:
-                        increment_usage(
+                        await increment_usage(
                             auth_info["user"]["id"],
                             auth_info["key"]["id"],
                             kilo_alias,
@@ -2319,7 +2309,7 @@ async def create_response(request: Request):
                         store_response(response_data["id"], response_data, input_data)
                         if auth_info:
                             try:
-                                increment_usage(
+                                await increment_usage(
                                     auth_info["user"]["id"],
                                     auth_info["key"]["id"],
                                     kilo_alias,
@@ -2343,7 +2333,7 @@ async def create_response(request: Request):
             # Track usage for authenticated customers
             if auth_info:
                 try:
-                    increment_usage(
+                    await increment_usage(
                         auth_info["user"]["id"],
                         auth_info["key"]["id"],
                         kilo_alias,
@@ -2437,25 +2427,30 @@ async def websocket_responses(websocket: WebSocket):
         if not api_key:
             auth_rejected = True
             reject_reason = "Missing API key"
+            reject_type = "authentication_error"
         elif not api_key.startswith("gw-"):
             auth_rejected = True
             reject_reason = "Invalid API key format"
+            reject_type = "authentication_error"
         else:
-            auth_info = validate_api_key(api_key)
+            auth_info = await validate_api_key(api_key)
             if auth_info is None:
                 auth_rejected = True
                 reject_reason = "Invalid API key"
+                reject_type = "authentication_error"
             elif auth_info.get("error") == "expired":
                 auth_rejected = True
                 reject_reason = "Subscription expired"
+                reject_type = "permission_error"
             else:
                 # Check daily quota
                 user = auth_info["user"]
                 plan = user.get("plan", "free")
-                allowed, used, limit = check_daily_quota(user["id"], plan)
+                allowed, used, limit = await check_daily_quota(user["id"], plan)
                 if not allowed:
                     auth_rejected = True
                     reject_reason = f"Daily quota exceeded ({used}/{limit})"
+                    reject_type = "rate_limit_error"
 
     # Accept WebSocket (FastAPI auto-completes handshake before handler runs)
     await websocket.accept()
@@ -2471,7 +2466,7 @@ async def websocket_responses(websocket: WebSocket):
                         "status": "failed",
                         "error": {
                             "message": reject_reason,
-                            "type": "authentication_error",
+                            "type": reject_type,
                         },
                     },
                 },
@@ -2567,11 +2562,19 @@ async def websocket_responses(websocket: WebSocket):
             openai_tools = []
             for t in tools:
                 t_type = t.get("type", "")
-                if t_type == "function" or ("name" in t and "parameters" in t):
+                if (
+                    t_type == "function"
+                    or ("name" in t and "parameters" in t)
+                    or ("function" in t)
+                ):
+                    # Handle both flat and wrapped formats:
+                    # Flat: {"type":"function","name":"Bash","parameters":{...}}
+                    # Wrapped: {"type":"function","function":{"name":"Bash","parameters":{...}}}
+                    inner = t.get("function", t)
                     func_def = {
-                        "name": t.get("name", ""),
-                        "description": t.get("description", ""),
-                        "parameters": t.get("parameters", {}),
+                        "name": inner.get("name", t.get("name", "")),
+                        "description": inner.get("description", t.get("description", "")),
+                        "parameters": inner.get("parameters", t.get("parameters", {})),
                     }
                     if t.get("strict") is not None:
                         func_def["strict"] = t["strict"]
@@ -2589,6 +2592,13 @@ async def websocket_responses(websocket: WebSocket):
                     )
             if openai_tools:
                 kilo_body["tools"] = openai_tools
+                # Pass through tool_choice if provided
+                tc = body.get("tool_choice")
+                if tc is not None:
+                    kilo_body["tool_choice"] = tc
+                ptc = body.get("parallel_tool_calls")
+                if ptc is not None:
+                    kilo_body["parallel_tool_calls"] = ptc
 
         headers = _build_kilo_headers()
 
@@ -2605,7 +2615,7 @@ async def websocket_responses(websocket: WebSocket):
         # Track usage for authenticated customers
         if auth_info:
             try:
-                increment_usage(
+                await increment_usage(
                     auth_info["user"]["id"],
                     auth_info["key"]["id"],
                     kilo_alias,

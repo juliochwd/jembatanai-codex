@@ -1,6 +1,6 @@
 # 📘 JembatanAI-Codex — Complete OpenAI/Codex Compatibility Guide
 
-**Last Updated**: 2026-03-24  
+**Last Updated**: 2026-03-28  
 **Status**: ✅ 100% OpenAI/Codex Compatible  
 **Port**: 4110
 
@@ -400,7 +400,7 @@ python3 -m uvicorn proxy_codex:app --port 4110
 
 ---
 
-**Last Updated**: 2026-03-24  
+**Last Updated**: 2026-03-28  
 **Status**: ✅ PRODUCTION READY  
 **Port**: 4110  
 **wire_api**: "responses" ✅
