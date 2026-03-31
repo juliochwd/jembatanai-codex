@@ -1,6 +1,6 @@
 # 📘 JembatanAI-Codex — Complete OpenAI/Codex Compatibility Guide
 
-**Last Updated**: 2026-03-28  
+**Last Updated**: 2026-03-31  
 **Status**: ✅ 100% OpenAI/Codex Compatible  
 **Port**: 4110
 

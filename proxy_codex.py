@@ -233,6 +233,11 @@ KILO_FREE_MODELS: dict[str, tuple[str, str, str]] = {
         "kilo-auto/free",
         "Kilo Auto Free (free, auto-routed best model)",
     ),
+    "kilo-active": (
+        "kilo",
+        "xiaomi/mimo-v2-pro:free",
+        "Kilo Active (admin-controlled active model)",
+    ),
 }
 _kilo_models_lock = threading.Lock()
 _kilo_models_last_refresh: float = 0
@@ -290,6 +295,42 @@ SESSION_TTL = 3600
 
 _session_state: dict = {}
 _state_lock = threading.Lock()
+
+# ─── Admin Model Override (synced from main proxy port 4100) ────────────
+# When enabled, ALL Codex CLI traffic uses kilo-active instead of user-selected model
+
+_main_proxy_url = os.environ.get("JEMBATANAI_PROXY_URL", "http://localhost:4100")
+_admin_override_cache: dict = {"enabled": False, "active_model": "kilo-mimo-v2-pro"}
+_admin_override_cache_time: float = 0
+_admin_override_cache_ttl: float = 30  # 30 seconds cache
+_admin_override_lock = threading.Lock()
+
+
+async def _sync_admin_override_from_main_proxy() -> dict:
+    """Sync admin override status from main proxy (port 4100)."""
+    global _admin_override_cache, _admin_override_cache_time
+    now = time.time()
+    # Force sync on first call (cache_time == 0 means never synced)
+    if _admin_override_cache_time > 0 and (now - _admin_override_cache_time) < _admin_override_cache_ttl:
+        return _admin_override_cache
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{_main_proxy_url}/api/admin-model-override")
+            if resp.status_code == 200:
+                data = resp.json()
+                with _admin_override_lock:
+                    _admin_override_cache = data
+                    _admin_override_cache_time = now
+                log.info(f"[ADMIN-OVERRIDE-CODEX] Synced from main proxy: enabled={data.get('enabled', False)}")
+    except Exception as e:
+        log.warning(f"[ADMIN-OVERRIDE-CODEX] Failed to sync from main proxy: {e}")
+    return _admin_override_cache
+
+
+def get_admin_override_status() -> dict:
+    """Get current admin override status (sync version for use in request handlers)."""
+    return _admin_override_cache
+
 
 # ─── Kilo Account Rotation ────────────────────────────────────────────
 
@@ -550,12 +591,43 @@ def _build_kilo_headers(kilo_token: str = "") -> dict:
 
 
 def resolve_codex_model(model: str) -> str:
-    """Resolve Codex model name → Kilo model alias."""
+    """Resolve Codex model name → Kilo model alias (sync version, uses cached override)."""
+    # Check admin override from cache (updated by async sync function)
+    override = get_admin_override_status()
+    if override and override.get("enabled"):
+        return "kilo-active"
+    # Normal resolution
     if model in MODEL_ALIAS_MAP:
         return MODEL_ALIAS_MAP[model]
     if model in KILO_FREE_MODELS:
         return model
     return "kilo-mimo-v2-pro"
+
+
+async def resolve_codex_model_async(model: str) -> tuple[str, str]:
+    """Resolve Codex model name → (kilo_alias, kilo_model_id).
+    When admin override is enabled, fetches the actual active model from main proxy.
+    Returns tuple of (alias, model_id)."""
+    # Sync override status from main proxy if cache is stale
+    await _sync_admin_override_from_main_proxy()
+    override = get_admin_override_status()
+    kilo_alias = resolve_codex_model(model)
+    if kilo_alias == "kilo-active":
+        # When override is active, fetch the actual active model from main proxy
+        active_model = override.get("active_model", "kilo-mimo-v2-pro")
+        # Get model_id from KILO_FREE_MODELS or use default
+        if active_model in KILO_FREE_MODELS:
+            _, model_id, _ = KILO_FREE_MODELS[active_model]
+        else:
+            # Fallback to mimo-v2-pro
+            model_id = "xiaomi/mimo-v2-pro:free"
+        log.info(f"[ADMIN-OVERRIDE-CODEX] Using active model: {active_model} ({model_id})")
+        return kilo_alias, model_id
+    # Normal case: look up model_id from KILO_FREE_MODELS
+    _, kilo_model_id, _ = KILO_FREE_MODELS.get(
+        kilo_alias, ("kilo", "xiaomi/mimo-v2-pro:free", "")
+    )
+    return kilo_alias, kilo_model_id
 
 
 def _model_id_to_alias(model_id: str) -> str:
@@ -648,8 +720,12 @@ async def _model_refresh_loop():
 # ─── Session Tracking (for anti-loop) ─────────────────────────────────
 
 
-def _get_session_hash_from_input(input_data: list) -> str:
+def _get_session_hash_from_input(input_data) -> str:
     """Generate session hash from Responses API input items."""
+    if isinstance(input_data, str):
+        return hashlib.md5(input_data[:200].encode()).hexdigest()[:16]
+    if not input_data:
+        return hashlib.md5(str(time.time()).encode()).hexdigest()[:16]
     texts = []
     for item in input_data:
         if item.get("type") == "message":
@@ -1083,6 +1159,49 @@ def _responses_to_messages(
     return messages
 
 
+def _convert_responses_tools_to_openai(tools: list) -> list:
+    """Convert Responses API tools format to OpenAI Chat Completions tools format.
+
+    Responses API (Codex CLI sends):
+      Flat:    {"type":"function","name":"shell","description":"...","parameters":{...}}
+      Wrapped: {"type":"function","function":{"name":"shell","description":"...","parameters":{...}}}
+      Custom:  {"type":"custom","name":"...","description":"..."}
+
+    OpenAI Chat Completions needs:
+      {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
+    """
+    openai_tools = []
+    for t in tools:
+        t_type = t.get("type", "")
+        if (
+            t_type == "function"
+            or ("name" in t and "parameters" in t)
+            or ("function" in t)
+        ):
+            inner = t.get("function", t)
+            func_def = {
+                "name": inner.get("name", t.get("name", "")),
+                "description": inner.get("description", t.get("description", "")),
+                "parameters": inner.get("parameters", t.get("parameters", {})),
+            }
+            if t.get("strict") is not None:
+                func_def["strict"] = t["strict"]
+            openai_tools.append({"type": "function", "function": func_def})
+        elif t_type == "custom":
+            openai_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name", ""),
+                        "description": t.get("description", ""),
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            )
+        # Skip: web_search_call, local_shell, computer_use, etc. — not supported by Chat Completions
+    return openai_tools
+
+
 def _convert_tool_call_to_output(tc: dict) -> dict:
     """Convert OpenAI tool_calls item to Responses API function_call output.
 
@@ -1114,8 +1233,8 @@ def _chat_to_responses(chat_response: dict, model: str) -> dict:
     - function_call items have "call_id" field
     """
     response_id = generate_response_id()
-    choices = chat_response.get("choices", [{}])
-    message = choices[0].get("message", {})
+    choices = chat_response.get("choices", [])
+    message = choices[0].get("message", {}) if choices else {}
 
     output = []
     content_text = message.get("content") or ""
@@ -1140,7 +1259,7 @@ def _chat_to_responses(chat_response: dict, model: str) -> dict:
             output.append(_convert_tool_call_to_output(tc))
 
     usage = chat_response.get("usage", {})
-    finish_reason = choices[0].get("finish_reason", "stop")
+    finish_reason = choices[0].get("finish_reason", "stop") if choices else "stop"
 
     # Custom models: ALWAYS "completed" — "incomplete" triggers continuation
     # which only works with native OpenAI models that support it.
@@ -1841,6 +1960,9 @@ async def health():
     kilo_ok = bool(_get_kilo_token())
     with _kilo_models_lock:
         model_count = len(KILO_FREE_MODELS)
+    # Sync admin override status
+    await _sync_admin_override_from_main_proxy()
+    override = get_admin_override_status()
     return {
         "status": "ok",
         "type": "codex",
@@ -1861,6 +1983,11 @@ async def health():
         "stored_responses": len(_responses_state),
         "uptime_seconds": int(time.time() - _server_start_time),
         "circuit_breakers": get_all_circuit_breakers(),
+        "admin_override": {
+            "enabled": override.get("enabled", False),
+            "active_model": override.get("active_model", None),
+            "synced_from": _main_proxy_url,
+        },
         "codex_compatible": True,
         "wire_api": "responses",
         "features": {
@@ -1880,7 +2007,53 @@ async def health():
             "500_error_tracking": True,
             "circuit_breaker": True,
             "alerts": True,
+            "admin_override": True,
         },
+    }
+
+
+@app.get("/api/admin-model-override")
+async def get_admin_model_override(request: Request):
+    """Get current admin model override status. Synced from main proxy."""
+    # Force sync on every API call to ensure fresh status
+    global _admin_override_cache_time
+    _admin_override_cache_time = 0  # Reset cache to force sync
+    await _sync_admin_override_from_main_proxy()
+    override = get_admin_override_status()
+    return {
+        "enabled": override.get("enabled", False),
+        "active_model": override.get("active_model", None),
+        "note": "Synced from main proxy (port 4100). Override is controlled via main proxy admin panel."
+    }
+
+
+@app.post("/api/admin-model-override")
+async def set_admin_model_override(request: Request):
+    """Set admin model override. Note: This proxies to main proxy (port 4100).
+    Override must be enabled/disabled via main proxy admin panel."""
+    try:
+        body = await request.json()
+        enabled = body.get("enabled", False)
+    except Exception:
+        enabled = False
+
+    # This endpoint proxies to main proxy for actual control
+    # For Codex proxy, we just return the current status
+    await _sync_admin_override_from_main_proxy()
+    override = get_admin_override_status()
+    current_enabled = override.get("enabled", False)
+
+    if enabled != current_enabled:
+        log.warning(
+            f"[ADMIN-OVERRIDE-CODEX] Cannot set override directly on Codex proxy. "
+            f"Use main proxy admin panel (port 4100) to control. "
+            f"Current: {current_enabled}, Requested: {enabled}"
+        )
+    return {
+        "ok": True,
+        "enabled": current_enabled,
+        "active_model": override.get("active_model", None),
+        "note": "Override is controlled via main proxy (port 4100). This endpoint is read-only."
     }
 
 
@@ -1921,7 +2094,6 @@ async def chat_completions(request: Request):
                 status_code=401,
             )
         auth_result = await validate_api_key(api_key)
-        log.info(f"[CHAT] DEBUG: validate_api_key result={auth_result is not None}, error={auth_result.get('error') if isinstance(auth_result, dict) else None}")
         if auth_result is None:
             return JSONResponse(
                 {
@@ -1961,10 +2133,7 @@ async def chat_completions(request: Request):
         model = body.get("model", "kilo-mimo-v2-pro")
         stream = body.get("stream", False)
 
-        kilo_alias = resolve_codex_model(model)
-        _, kilo_model_id, _ = KILO_FREE_MODELS.get(
-            kilo_alias, ("kilo", "xiaomi/mimo-v2-pro:free", "")
-        )
+        kilo_alias, kilo_model_id = await resolve_codex_model_async(model)
 
         log.info(f"[CHAT] {model} → {kilo_alias} ({kilo_model_id}) stream={stream}")
 
@@ -2002,11 +2171,9 @@ async def chat_completions(request: Request):
                 media_type="text/event-stream",
             )
         else:
-            log.info(f"[CHAT] DEBUG: Before _request_with_retry, auth_result={auth_result is not None}")
             resp = await _request_with_retry(
                 f"{KILO_API_URL}/chat/completions", kilo_body, headers
             )
-            log.info(f"[CHAT] DEBUG: After request, resp={resp is not None}, status={resp.status_code if resp else None}")
             if resp is None or resp.status_code != 200:
                 # Fallback to OpenRouter when Kilo is exhausted or down
                 if _kilo_is_exhausted() or _kilo_is_down():
@@ -2037,7 +2204,6 @@ async def chat_completions(request: Request):
             # Track usage for authenticated customers
             if auth_result:
                 try:
-                    log.info(f"[CHAT] Incrementing usage for user {auth_result['user']['id']}")
                     await increment_usage(
                         auth_result["user"]["id"],
                         auth_result["key"]["id"],
@@ -2163,11 +2329,8 @@ async def create_response(request: Request):
         truncation = body.get("truncation")  # Codex sends "auto"|"disabled"
         store = body.get("store", True)  # Whether to store response for chaining
 
-        # Resolve model
-        kilo_alias = resolve_codex_model(model)
-        _, kilo_model_id, _ = KILO_FREE_MODELS.get(
-            kilo_alias, ("kilo", "xiaomi/mimo-v2-pro:free", "")
-        )
+        # Resolve model (async to check admin override)
+        kilo_alias, kilo_model_id = await resolve_codex_model_async(model)
         log.info(
             f"[RESPONSE] {model} → {kilo_alias} ({kilo_model_id}) prev={previous_response_id[:20] if previous_response_id else 'None'} stream={stream}"
         )
@@ -2177,8 +2340,36 @@ async def create_response(request: Request):
             input_data, previous_response_id, instructions
         )
 
-        # Direct routing: no loop detection, no session tracking
-        session: dict = {}
+        # Session tracking + loop detection
+        session_hash = _get_session_hash_from_input(input_data)
+        session = _get_session_state(session_hash)
+        is_loop, loop_reason = _detect_loop_in_request(session, messages)
+        if is_loop:
+            log.warning(f"[LOOP-BLOCKED] session={session_hash} reason={loop_reason}")
+            loop_resp = {
+                "id": generate_response_id(),
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": model,
+                "output": [
+                    {
+                        "type": "message",
+                        "id": _generate_item_id("msg"),
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": f"[Loop detected: {loop_reason}. Task complete.]",
+                            }
+                        ],
+                    }
+                ],
+                "status": "completed",
+                "error": None,
+            }
+            return JSONResponse(loop_resp)
+        _update_session_state(session, messages)
 
         # Build Kilo request
         kilo_body = {
@@ -2213,57 +2404,14 @@ async def create_response(request: Request):
             kilo_body["reasoning"] = {"effort": effort}
             kilo_body["reasoning_effort"] = effort
 
-        # Convert Responses API tools → OpenAI Chat Completions tools format
-        # Codex sends flat: {"type":"function","name":"shell","description":"...","parameters":{...}}
-        # Kilo Chat Completions needs: {"type":"function","function":{"name":"shell","description":"...","parameters":{...}}}
+        # Convert Responses API tools → OpenAI Chat Completions format
         if tools:
-            openai_tools = []
-            for t in tools:
-                t_type = t.get("type", "")
-                if (
-                    t_type == "function"
-                    or ("name" in t and "parameters" in t)
-                    or ("function" in t)
-                ):
-                    # Handle both flat and wrapped formats:
-                    # Flat: {"type":"function","name":"Bash","description":"...","parameters":{...}}
-                    # Wrapped: {"type":"function","function":{"name":"Bash","description":"...","parameters":{...}}}
-                    inner = t.get("function", t)
-                    func_def = {
-                        "name": inner.get("name", t.get("name", "")),
-                        "description": inner.get(
-                            "description", t.get("description", "")
-                        ),
-                        "parameters": inner.get("parameters", t.get("parameters", {})),
-                    }
-                    if t.get("strict") is not None:
-                        func_def["strict"] = t["strict"]
-                    openai_tools.append(
-                        {
-                            "type": "function",
-                            "function": func_def,
-                        }
-                    )
-                elif t_type == "custom":
-                    # Freeform tool → convert to function type
-                    openai_tools.append(
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": t.get("name", ""),
-                                "description": t.get("description", ""),
-                                "parameters": {"type": "object", "properties": {}},
-                            },
-                        }
-                    )
-                # Skip other tool types (web_search, local_shell, etc.) — not supported
+            openai_tools = _convert_responses_tools_to_openai(tools)
             if openai_tools:
                 kilo_body["tools"] = openai_tools
-                # Pass through tool_choice if provided
                 tc = body.get("tool_choice")
                 if tc is not None:
                     kilo_body["tool_choice"] = tc
-                # Pass through parallel_tool_calls if provided
                 ptc = body.get("parallel_tool_calls")
                 if ptc is not None:
                     kilo_body["parallel_tool_calls"] = ptc
@@ -2516,11 +2664,8 @@ async def websocket_responses(websocket: WebSocket):
         temperature = body.get("temperature")
         top_p = body.get("top_p")
 
-        # Resolve model
-        kilo_alias = resolve_codex_model(model)
-        _, kilo_model_id, _ = KILO_FREE_MODELS.get(
-            kilo_alias, ("kilo", "xiaomi/mimo-v2-pro:free", "")
-        )
+        # Resolve model (async to check admin override)
+        kilo_alias, kilo_model_id = await resolve_codex_model_async(model)
         log.info(f"[WS] {model} → {kilo_alias} ({kilo_model_id})")
 
         # Convert input to messages
@@ -2528,8 +2673,47 @@ async def websocket_responses(websocket: WebSocket):
             input_data, previous_response_id, instructions
         )
 
-        # Direct routing: no loop detection, no session tracking
-        session: dict = {}
+        # Session tracking + loop detection
+        session_hash = _get_session_hash_from_input(input_data)
+        session = _get_session_state(session_hash)
+        is_loop, loop_reason = _detect_loop_in_request(session, messages)
+        if is_loop:
+            log.warning(f"[WS-LOOP-BLOCKED] session={session_hash} reason={loop_reason}")
+            loop_event = _sse_event(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": generate_response_id(),
+                        "object": "response",
+                        "created_at": int(time.time()),
+                        "model": model,
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": _generate_item_id("msg"),
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": f"[Loop detected: {loop_reason}. Task complete.]",
+                                    }
+                                ],
+                            }
+                        ],
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            )
+            try:
+                await websocket.send_text(loop_event)
+                await websocket.close(code=1000, reason="Loop detected")
+            except Exception:
+                pass
+            return
+        _update_session_state(session, messages)
 
         # Build Kilo request
         kilo_body = {
@@ -2557,42 +2741,11 @@ async def websocket_responses(websocket: WebSocket):
             kilo_body["reasoning"] = {"effort": effort}
             kilo_body["reasoning_effort"] = effort
 
-        # Convert tools
+        # Convert Responses API tools → OpenAI Chat Completions format
         if tools:
-            openai_tools = []
-            for t in tools:
-                t_type = t.get("type", "")
-                if (
-                    t_type == "function"
-                    or ("name" in t and "parameters" in t)
-                    or ("function" in t)
-                ):
-                    # Handle both flat and wrapped formats:
-                    # Flat: {"type":"function","name":"Bash","parameters":{...}}
-                    # Wrapped: {"type":"function","function":{"name":"Bash","parameters":{...}}}
-                    inner = t.get("function", t)
-                    func_def = {
-                        "name": inner.get("name", t.get("name", "")),
-                        "description": inner.get("description", t.get("description", "")),
-                        "parameters": inner.get("parameters", t.get("parameters", {})),
-                    }
-                    if t.get("strict") is not None:
-                        func_def["strict"] = t["strict"]
-                    openai_tools.append({"type": "function", "function": func_def})
-                elif t_type == "custom":
-                    openai_tools.append(
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": t.get("name", ""),
-                                "description": t.get("description", ""),
-                                "parameters": {"type": "object", "properties": {}},
-                            },
-                        }
-                    )
+            openai_tools = _convert_responses_tools_to_openai(tools)
             if openai_tools:
                 kilo_body["tools"] = openai_tools
-                # Pass through tool_choice if provided
                 tc = body.get("tool_choice")
                 if tc is not None:
                     kilo_body["tool_choice"] = tc
