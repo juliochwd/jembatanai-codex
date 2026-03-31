@@ -300,7 +300,7 @@ _state_lock = threading.Lock()
 # When enabled, ALL Codex CLI traffic uses kilo-active instead of user-selected model
 
 _main_proxy_url = os.environ.get("JEMBATANAI_PROXY_URL", "http://localhost:4100")
-_admin_override_cache: dict = {"enabled": False, "active_model": "kilo-mimo-v2-pro"}
+_admin_override_cache: dict = {"enabled": True, "active_model": "kilo-mimo-v2-pro"}  # Default ON: always force active model
 _admin_override_cache_time: float = 0
 _admin_override_cache_ttl: float = 30  # 30 seconds cache
 _admin_override_lock = threading.Lock()
